@@ -1,0 +1,38 @@
+{
+  "id": "djtouchette.typecheck-gate",
+  "name": "Typecheck Gate",
+  "apiVersion": "1",
+  "server": {
+    "command": "node",
+    "args": [
+      "server.js"
+    ],
+    "port": 9208,
+    "health": "/health"
+  },
+  "panes": [
+    {
+      "type": "djtouchette.typecheck-gate",
+      "title": "Typecheck Gate",
+      "icon": "\ud83d\udeaa",
+      "scope": "agent",
+      "path": "/"
+    }
+  ],
+  "settings": [
+    {
+      "key": "checkCommand",
+      "label": "Check command",
+      "type": "string",
+      "default": "npm run typecheck",
+      "help": "Command that must exit 0 to pass the gate."
+    }
+  ],
+  "capabilities": [
+    "claude.gate",
+    "notifications.post"
+  ],
+  "consumes": [
+    "agent.state_changed"
+  ]
+}
