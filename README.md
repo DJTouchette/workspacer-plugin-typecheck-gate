@@ -6,15 +6,39 @@ A [workspacer](https://github.com/DJTouchette/workspacer) hub plugin (sidecar). 
 
 ## What it does
 
-When an agent reaches Stop, runs your typecheck/lint command and uses `claude.gate` to hold the turn open (with the errors) if it fails — so 'done' actually means green.
+When an agent ends a turn (`agent.state_changed` with `hookEvent === "Stop"`), the
+sidecar runs your typecheck/lint command in that agent's working directory. If the
+command exits non-zero it:
+
+1. calls `claude.gate` (`{ sessionId, on: true }`) to **hold the turn open** so the
+   agent can't "finish" red;
+2. feeds the error output back to the agent via `agents.sendMessage` so it can fix
+   the failures and re-run; and
+3. posts a desktop notification via `notifications.post`.
+
+If the check passes it does nothing — and if this session had been gated by a
+previous failure, the gate is released (`claude.gate { on: false }`) now that it's
+green.
+
+Guardrails:
+
+- The check runs asynchronously (`child_process.exec`) so it never blocks the bus
+  event loop, with a 180s timeout and a bounded output buffer.
+- Each Stop is gated at most once: an in-flight guard plus an 8s per-session
+  cooldown coalesce the duplicate/rapid Stop events claudemon can emit.
+- Fed-back error output is truncated to its last ~4000 chars.
 
 ## Bus wiring
 
 - **Subscribes to:** `agent.state_changed`
-- **Calls capabilities:** `claude.gate`, `notifications.post`
+- **Calls capabilities:** `claude.gate`, `agents.sendMessage`, `agents.list`, `notifications.post`
+  - `claude.gate` only takes `{ sessionId, on }` (a boolean hold) — it can't carry a
+    message, so the failing output is delivered to the agent with `agents.sendMessage`.
+  - `agents.list` is used only as a fallback to resolve the agent's `cwd` when the
+    `agent.state_changed` event doesn't carry one.
 - **Emits:** —
 - **Settings:**
-- `checkCommand` (string) — Command that must exit 0 to pass the gate.
+- `checkCommand` (string, default `npm run typecheck`) — Command that must exit 0 to pass the gate.
 
 ## Run it
 
@@ -25,7 +49,12 @@ When an agent reaches Stop, runs your typecheck/lint command and uses `claude.ga
 
 ## Implement
 
-Edit `server.js` → `onEvent(event)`. Subscribed topics arrive there; use `call('method', params)` for capabilities and `publish('command.x', data)` for commands. `settings` holds the host-injected config above.
+The logic lives in `server.js` → `onEvent(event)`. It filters for
+`agent.state_changed` events with `hookEvent === "Stop"`, resolves the agent's
+`cwd` (from the event, falling back to `agents.list`), runs `settings.checkCommand`
+there, and on failure calls `claude.gate` + `agents.sendMessage` +
+`notifications.post` as described above. Per-session `lastRunAt` / `inFlight` /
+`gatedSessions` maps provide the dedup, cooldown, and gate-release behavior.
 
 ## Layout
 

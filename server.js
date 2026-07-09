@@ -7,6 +7,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { exec } = require('child_process');
 
 const DIR = __dirname;
 const manifest = JSON.parse(fs.readFileSync(path.join(DIR, 'plugin.json'), 'utf8'));
@@ -67,11 +68,119 @@ function connect() {
   ws.addEventListener('error', () => { try { ws.close(); } catch {} });
 }
 
-// ── Your plugin logic ─────────────────────────────────────────────────────────
+// ── Typecheck gate logic ──────────────────────────────────────────────────────
+// When an agent ends a turn (hookEvent === 'Stop'), run the configured check
+// command in the agent's cwd. If it fails, hold the turn open with claude.gate,
+// feed the error output back to the agent (agents.sendMessage) so it can fix it,
+// and notify the human. If it passes, do nothing.
+const CHECK_COMMAND = (settings.checkCommand && String(settings.checkCommand).trim()) || 'npm run typecheck';
+const CHECK_TIMEOUT_MS = 180_000; // don't let a wedged check run forever
+const COOLDOWN_MS = 8_000;        // coalesce duplicate Stop events for a session
+const MAX_FEEDBACK_CHARS = 4_000; // keep the fed-back error tail bounded
+
+// Per-session bookkeeping so we never gate the same Stop twice and never run
+// two checks for one session concurrently.
+const lastRunAt = new Map();   // sessionId -> epoch ms of last check start
+const inFlight = new Set();    // sessionIds with a check currently running
+const gatedSessions = new Set(); // sessionIds we've turned the gate on for
+
+// Resolve the agent's working directory: prefer the event payload, fall back to
+// the live roster (agents.list) keyed by sessionId.
+async function resolveCwd(sessionId, evCwd) {
+  if (evCwd && typeof evCwd === 'string') return evCwd;
+  try {
+    const roster = await call('agents.list', {});
+    if (Array.isArray(roster)) {
+      const hit = roster.find((a) => a && a.sessionId === sessionId);
+      if (hit && hit.cwd) return hit.cwd;
+    }
+  } catch (e) {
+    log('agents.list fallback failed: ' + e.message);
+  }
+  return null;
+}
+
+// Run the check command async so we never block the bus event loop.
+function runCheck(cwd) {
+  return new Promise((resolve) => {
+    exec(
+      CHECK_COMMAND,
+      { cwd, timeout: CHECK_TIMEOUT_MS, windowsHide: true, maxBuffer: 8 * 1024 * 1024, env: process.env },
+      (err, stdout, stderr) => {
+        const out = ((stdout || '') + (stderr || '')).trim();
+        if (!err) return resolve({ ok: true, output: out });
+        // err.code is the exit status; null means killed (e.g. timeout).
+        resolve({ ok: false, output: out, code: err.code ?? null, killed: !!err.killed });
+      },
+    );
+  });
+}
+
+function tail(s, n) {
+  if (!s) return '';
+  return s.length > n ? '…\n' + s.slice(-n) : s;
+}
+
 async function onEvent(event) {
-  log('event ' + event.type);
-  // TODO: react to `event`. Use call('cap.method', {...}) for capabilities,
-  // publish('command.x', {...}) for commands, or fetch(...) to reach outside.
+  const data = event && event.data ? event.data : {};
+  // Only care about an agent that just ended a turn.
+  if (event.type !== 'agent.state_changed' || data.hookEvent !== 'Stop') return;
+
+  const sessionId = data.sessionId;
+  if (!sessionId) return;
+
+  // Dedup: skip if a check is running or one ran very recently for this session.
+  if (inFlight.has(sessionId)) return;
+  const prev = lastRunAt.get(sessionId);
+  if (prev && Date.now() - prev < COOLDOWN_MS) return;
+
+  const cwd = await resolveCwd(sessionId, data.cwd);
+  if (!cwd) { log('no cwd for ' + sessionId + '; skipping check'); return; }
+
+  lastRunAt.set(sessionId, Date.now());
+  inFlight.add(sessionId);
+  log('Stop → running `' + CHECK_COMMAND + '` in ' + cwd + ' (' + sessionId + ')');
+  try {
+    const res = await runCheck(cwd);
+    if (res.ok) {
+      log('check passed for ' + sessionId);
+      // If we'd previously gated this session, release the hold now that it's green.
+      if (gatedSessions.has(sessionId)) {
+        try { await call('claude.gate', { sessionId, on: false }); } catch (e) { log('ungate failed: ' + e.message); }
+        gatedSessions.delete(sessionId);
+      }
+      return;
+    }
+
+    const reason = res.killed
+      ? 'timed out after ' + Math.round(CHECK_TIMEOUT_MS / 1000) + 's'
+      : 'exited ' + res.code;
+    log('check FAILED (' + reason + ') for ' + sessionId + ' — gating');
+
+    // 1) Hold the turn open so the agent can't "finish" red.
+    try { await call('claude.gate', { sessionId, on: true }); gatedSessions.add(sessionId); }
+    catch (e) { log('claude.gate failed: ' + e.message); }
+
+    // 2) Feed the error output back to the agent so it can fix it. (claude.gate
+    //    is a boolean hold and can't carry a message, so we deliver the details
+    //    via agents.sendMessage.)
+    const feedback =
+      'Typecheck gate: `' + CHECK_COMMAND + '` ' + reason + ' in ' + cwd + '.\n' +
+      "Do not finish yet — fix these errors, then re-run the check:\n\n" +
+      (tail(res.output, MAX_FEEDBACK_CHARS) || '(no output captured)');
+    try { await call('agents.sendMessage', { sessionId, text: feedback }); }
+    catch (e) { log('agents.sendMessage failed: ' + e.message); }
+
+    // 3) Let the human know.
+    try {
+      await call('notifications.post', {
+        title: 'Typecheck gate blocked a finish',
+        body: '`' + CHECK_COMMAND + '` ' + reason + ' in ' + cwd,
+      });
+    } catch (e) { log('notifications.post failed: ' + e.message); }
+  } finally {
+    inFlight.delete(sessionId);
+  }
 }
 
 const server = http.createServer((req, res) => {

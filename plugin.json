@@ -30,6 +30,8 @@
   ],
   "capabilities": [
     "claude.gate",
+    "agents.sendMessage",
+    "agents.list",
     "notifications.post"
   ],
   "consumes": [
