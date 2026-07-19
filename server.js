@@ -8,64 +8,24 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
+const { connect } = require('./wks.js');
 
 const DIR = __dirname;
 const manifest = JSON.parse(fs.readFileSync(path.join(DIR, 'plugin.json'), 'utf8'));
 const PORT = Number(process.env.PORT || (manifest.server && manifest.server.port) || 9200);
 
-// The hub injects the bus URL + this plugin's scoped token. Accept the common
-// conventions so the scaffold runs however your hub wires it.
-const BUS_URL = process.env.WKS_BUS_URL || 'ws://127.0.0.1:7895/bus';
-function readToken() {
-  if (process.env.WKS_BUS_TOKEN) return process.env.WKS_BUS_TOKEN;
-  try { return fs.readFileSync(path.join(DIR, '.bus-token'), 'utf8').trim(); } catch { return ''; }
-}
-// Host-injected settings (from manifest `settings`), passed as JSON in env.
-let settings = {};
-try { settings = JSON.parse(process.env.WKS_SETTINGS || '{}'); } catch {}
+// The workspacer plugin SDK (vendored wks.js): connect to the hub bus (scoped
+// token, auto-subscribe, reconnect loop) and expose ready/on/call/publish/settings.
+const wks = connect({ source: manifest.id });
+const settings = wks.settings;
 
 const TOPICS = manifest.consumes || [];
 const recent = [];
-let ws = null, connected = false, callSeq = 0;
-const pending = new Map();
 
 function log(msg) {
   console.log('[' + manifest.id + '] ' + msg);
   recent.unshift(new Date().toISOString() + '  ' + msg);
   if (recent.length > 100) recent.pop();
-}
-
-// Call a hub capability (must be declared in plugin.json `capabilities`).
-function call(method, params) {
-  return new Promise((resolve, reject) => {
-    if (!connected) return reject(new Error('not connected'));
-    const id = 'c' + (++callSeq);
-    pending.set(id, { resolve, reject });
-    ws.send(JSON.stringify({ op: 'call', id, method, params: params || {} }));
-    setTimeout(() => { if (pending.has(id)) { pending.delete(id); reject(new Error('timeout')); } }, 8000);
-  });
-}
-// Publish an event/command (must be declared in `emits`).
-function publish(type, data) {
-  if (connected) ws.send(JSON.stringify({ op: 'publish', event: { type, source: manifest.id, data: data || {} } }));
-}
-
-function connect() {
-  const tok = readToken();
-  ws = new WebSocket(BUS_URL + (tok ? '?token=' + encodeURIComponent(tok) : ''));
-  ws.addEventListener('open', () => {
-    connected = true;
-    if (TOPICS.length) ws.send(JSON.stringify({ op: 'subscribe', topics: TOPICS }));
-    log('connected; subscribed to ' + (TOPICS.join(', ') || '(nothing)'));
-  });
-  ws.addEventListener('message', (ev) => {
-    let f; try { f = JSON.parse(ev.data); } catch { return; }
-    if (f.op === 'event' && f.event) onEvent(f.event).catch((e) => log('onEvent error: ' + e.message));
-    else if (f.op === 'result' && pending.has(f.id)) { pending.get(f.id).resolve(f.result); pending.delete(f.id); }
-    else if (f.op === 'error' && pending.has(f.id)) { pending.get(f.id).reject(new Error(f.error)); pending.delete(f.id); }
-  });
-  ws.addEventListener('close', () => { connected = false; setTimeout(connect, 1500); });
-  ws.addEventListener('error', () => { try { ws.close(); } catch {} });
 }
 
 // ── Typecheck gate logic ──────────────────────────────────────────────────────
@@ -89,7 +49,7 @@ const gatedSessions = new Set(); // sessionIds we've turned the gate on for
 async function resolveCwd(sessionId, evCwd) {
   if (evCwd && typeof evCwd === 'string') return evCwd;
   try {
-    const roster = await call('agents.list', {});
+    const roster = await wks.call('agents.list', {});
     if (Array.isArray(roster)) {
       const hit = roster.find((a) => a && a.sessionId === sessionId);
       if (hit && hit.cwd) return hit.cwd;
@@ -146,7 +106,7 @@ async function onEvent(event) {
       log('check passed for ' + sessionId);
       // If we'd previously gated this session, release the hold now that it's green.
       if (gatedSessions.has(sessionId)) {
-        try { await call('claude.gate', { sessionId, on: false }); } catch (e) { log('ungate failed: ' + e.message); }
+        try { await wks.call('claude.gate', { sessionId, on: false }); } catch (e) { log('ungate failed: ' + e.message); }
         gatedSessions.delete(sessionId);
       }
       return;
@@ -158,7 +118,7 @@ async function onEvent(event) {
     log('check FAILED (' + reason + ') for ' + sessionId + ' — gating');
 
     // 1) Hold the turn open so the agent can't "finish" red.
-    try { await call('claude.gate', { sessionId, on: true }); gatedSessions.add(sessionId); }
+    try { await wks.call('claude.gate', { sessionId, on: true }); gatedSessions.add(sessionId); }
     catch (e) { log('claude.gate failed: ' + e.message); }
 
     // 2) Feed the error output back to the agent so it can fix it. (claude.gate
@@ -168,12 +128,12 @@ async function onEvent(event) {
       'Typecheck gate: `' + CHECK_COMMAND + '` ' + reason + ' in ' + cwd + '.\n' +
       "Do not finish yet — fix these errors, then re-run the check:\n\n" +
       (tail(res.output, MAX_FEEDBACK_CHARS) || '(no output captured)');
-    try { await call('agents.sendMessage', { sessionId, text: feedback }); }
+    try { await wks.call('agents.sendMessage', { sessionId, text: feedback }); }
     catch (e) { log('agents.sendMessage failed: ' + e.message); }
 
     // 3) Let the human know.
     try {
-      await call('notifications.post', {
+      await wks.call('notifications.post', {
         title: 'Typecheck gate blocked a finish',
         body: '`' + CHECK_COMMAND + '` ' + reason + ' in ' + cwd,
       });
@@ -191,7 +151,7 @@ const server = http.createServer((req, res) => {
     + 'background:var(--wks-bg-base,#161616);color:var(--wks-text-primary,#e8e8e8);margin:0;padding:14px">'
     + '<h2 style="font-size:1rem">' + manifest.name + '</h2>'
     + '<p style="color:var(--wks-text-muted,#888);font-size:.8rem">'
-    + (connected ? '\u{1F7E2} connected to hub' : '\u{1F534} disconnected')
+    + (wks.connected ? '\u{1F7E2} connected to hub' : '\u{1F534} disconnected')
     + ' · subscribed to ' + (TOPICS.join(', ') || '(nothing)') + '</p>'
     + '<pre style="font-size:.7rem;color:var(--wks-text-faint,#777);white-space:pre-wrap">'
     + (recent.map(escapeHtml).join('\n') || 'waiting for events…') + '</pre>'
@@ -199,4 +159,8 @@ const server = http.createServer((req, res) => {
 });
 function escapeHtml(s) { return String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
 server.listen(PORT, '127.0.0.1', () => log('pane on http://127.0.0.1:' + PORT));
-connect();
+
+// Route each consumed bus event to onEvent (the SDK subscribes to '*'; we
+// dispatch only the topics this plugin declares in plugin.json `consumes`).
+for (const t of TOPICS) wks.on(t, (_data, ev) => { onEvent(ev).catch((e) => log('onEvent error: ' + e.message)); });
+wks.ready.then(() => log('connected; subscribed to ' + (TOPICS.join(', ') || '(nothing)')));
