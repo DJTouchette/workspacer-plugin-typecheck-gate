@@ -34,6 +34,7 @@ function log(msg) {
 // feed the error output back to the agent (agents.sendMessage) so it can fix it,
 // and notify the human. If it passes, do nothing.
 const CHECK_COMMAND = (settings.checkCommand && String(settings.checkCommand).trim()) || 'npm run typecheck';
+const NOTIFY = settings.notify !== false; // user toggle: gate notifications
 const CHECK_TIMEOUT_MS = 180_000; // don't let a wedged check run forever
 const COOLDOWN_MS = 8_000;        // coalesce duplicate Stop events for a session
 const MAX_FEEDBACK_CHARS = 4_000; // keep the fed-back error tail bounded
@@ -43,6 +44,32 @@ const MAX_FEEDBACK_CHARS = 4_000; // keep the fed-back error tail bounded
 const lastRunAt = new Map();   // sessionId -> epoch ms of last check start
 const inFlight = new Set();    // sessionIds with a check currently running
 const gatedSessions = new Set(); // sessionIds we've turned the gate on for
+const warnedSessions = new Set(); // sessionIds we've posted a "blocked" notification for
+
+// Post into the notification center (+ OS toast, per user prefs). One `key`
+// slot per session: a repeat failure REPLACES the previous warning instead of
+// stacking, and the eventual green replaces the warning with a success.
+// sessionId makes the notification click focus the gated agent.
+async function notifyGate(sessionId, level, title, body) {
+  if (!NOTIFY) return;
+  try {
+    await wks.call('notifications.post', {
+      title, body, level,
+      source: 'plugin:' + manifest.id,
+      sessionId,
+      key: 'gate:' + sessionId,
+    });
+  } catch (e) { log('notifications.post failed: ' + e.message); }
+}
+
+// Best-effort error count from the check output ("error TS2345", "3 errors",
+// eslint's "✖ 12 problems"… anything with the word "error" per line).
+function countErrors(output) {
+  if (!output) return 0;
+  let n = 0;
+  for (const line of output.split('\n')) if (/\berrors?\b/i.test(line)) n++;
+  return n;
+}
 
 // Resolve the agent's working directory: prefer the event payload, fall back to
 // the live roster (agents.list) keyed by sessionId.
@@ -109,6 +136,13 @@ async function onEvent(event) {
         try { await wks.call('claude.gate', { sessionId, on: false }); } catch (e) { log('ungate failed: ' + e.message); }
         gatedSessions.delete(sessionId);
       }
+      // Green after having warned: replace the standing warning (same key) with
+      // a success. Routine first-try passes stay silent.
+      if (warnedSessions.has(sessionId)) {
+        warnedSessions.delete(sessionId);
+        await notifyGate(sessionId, 'success', 'Typecheck gate cleared',
+          '`' + CHECK_COMMAND + '` now passes in ' + cwd);
+      }
       return;
     }
 
@@ -131,13 +165,13 @@ async function onEvent(event) {
     try { await wks.call('agents.sendMessage', { sessionId, text: feedback }); }
     catch (e) { log('agents.sendMessage failed: ' + e.message); }
 
-    // 3) Let the human know.
-    try {
-      await wks.call('notifications.post', {
-        title: 'Typecheck gate blocked a finish',
-        body: '`' + CHECK_COMMAND + '` ' + reason + ' in ' + cwd,
-      });
-    } catch (e) { log('notifications.post failed: ' + e.message); }
+    // 3) Let the human know (warn, keyed per session so repeat failures
+    //    replace the previous warning instead of stacking).
+    const errs = countErrors(res.output);
+    warnedSessions.add(sessionId);
+    await notifyGate(sessionId, 'warn', 'Typecheck gate blocked a finish',
+      '`' + CHECK_COMMAND + '` ' + reason + (errs ? ' — ' + errs + ' error line' + (errs === 1 ? '' : 's') : '')
+      + ' in ' + cwd);
   } finally {
     inFlight.delete(sessionId);
   }

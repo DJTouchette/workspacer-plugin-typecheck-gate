@@ -14,11 +14,18 @@ command exits non-zero it:
    agent can't "finish" red;
 2. feeds the error output back to the agent via `agents.sendMessage` so it can fix
    the failures and re-run; and
-3. posts a desktop notification via `notifications.post`.
+3. posts a **warn** notification via `notifications.post` — it lands in workspacer's
+   in-app notification center (bell + toast) and, per your notification
+   preferences, as a clickable OS notification. Clicking it focuses the gated
+   agent. The body names the failing command and a best-effort error-line count.
+   Notifications are keyed **per session**, so a repeat failure replaces the
+   standing warning instead of stacking.
 
-If the check passes it does nothing — and if this session had been gated by a
-previous failure, the gate is released (`claude.gate { on: false }`) now that it's
-green.
+If the check passes on the first try it does nothing (no notification). If this
+session had been gated by a previous failure, the gate is released
+(`claude.gate { on: false }`) and a **success** notification with the same key
+replaces the warning, so the center shows the gate's current truth, not its
+history.
 
 Guardrails:
 
@@ -39,6 +46,8 @@ Guardrails:
 - **Emits:** —
 - **Settings:**
 - `checkCommand` (string, default `npm run typecheck`) — Command that must exit 0 to pass the gate.
+- `notify` (boolean, default `true`) — Post the warn/success gate notifications;
+  off silences them, but the gate + agent feedback still apply.
 
 ## Run it
 

@@ -2,7 +2,7 @@
   "id": "djtouchette.typecheck-gate",
   "name": "Typecheck Gate",
   "apiVersion": "1",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "server": {
     "command": "node",
     "args": [
@@ -27,6 +27,13 @@
       "type": "string",
       "default": "npm run typecheck",
       "help": "Command that must exit 0 to pass the gate."
+    },
+    {
+      "key": "notify",
+      "label": "Notify when the gate blocks",
+      "type": "boolean",
+      "default": true,
+      "help": "Warn notification when the gate blocks a finish (and a success when it later clears). The gate itself always applies."
     }
   ],
   "capabilities": [
